@@ -20,11 +20,32 @@ import (
 type batchProcessResult int
 
 const (
-	batchSuccess  batchProcessResult = iota // continue normal processing
-	batchContinue                           // equivalent to continue mainloop
-	batchBreak                              // equivalent to break mainloop
-	batchError                              // error occurred, exit function
+	batchSuccess   batchProcessResult = iota // continue normal processing
+	batchContinue                            // equivalent to continue mainloop
+	batchBreak                               // equivalent to break mainloop
+	batchError                               // error occurred, exit function
+	batchThrottled                           // GetRecords was throttled; retry the same iterator after a backoff
 )
+
+// maxThrottleBackoff caps the wait between GetRecords retries after
+// ProvisionedThroughputExceededException.
+const maxThrottleBackoff = 10 * time.Second
+
+// throttleBackoff returns base doubled once per consecutive throttle, capped at
+// maxThrottleBackoff. The doubling stops at the cap, so a long run of throttles
+// cannot overflow the shift.
+func throttleBackoff(base time.Duration, consecutive int) time.Duration {
+	backoff := base
+	for i := 0; i < consecutive && backoff < maxThrottleBackoff; i++ {
+		backoff *= 2
+	}
+
+	if backoff > maxThrottleBackoff {
+		return maxThrottleBackoff
+	}
+
+	return backoff
+}
 
 // getShardIterator gets a shard iterator after the last sequence number we read or at the start of the stream
 func getShardIterator(k kinsumeriface.KinesisAPI, streamName string, shardID string, sequenceNumber string, iteratorStartTimestamp *time.Time) (string, error) {
@@ -140,6 +161,16 @@ func (k *Kinsumer) processRecordsBatch(iterator string, shardID string, checkpoi
 				}
 				// retry infinitely after expired iterator is renewed successfully
 				return newIterator, batchContinue, nil
+			}
+
+			// The per-shard read limit (5 GetRecords/s, 2 MB/s) is shared by every
+			// polling consumer, so a well-behaved consumer can be throttled purely by
+			// its neighbours. Throttling does not invalidate the iterator: keep it
+			// and let consume back off, rather than ending the shard consumer.
+			var pte *ktypes.ProvisionedThroughputExceededException
+			if errors.As(err, &pte) {
+				k.config.logger.Log("Throttled reading shard %s, backing off: %s", shardID, pte.ErrorMessage())
+				return iterator, batchThrottled, nil
 			}
 		}
 		return "", batchError, fmt.Errorf("getRecords: %w", err)
@@ -261,6 +292,8 @@ func (k *Kinsumer) consume(shardID string) {
 	var lastSeqToCheckp string
 	// lastSeqNum is used to check if a batch of data is the last in the stream
 	var lastSeqNum string
+	// consecutiveThrottles drives the backoff after ProvisionedThroughputExceededException
+	var consecutiveThrottles int
 mainloop:
 	for {
 		// We have reached the end of the shard's data. Set Finished in dynamo and stop processing.
@@ -302,7 +335,17 @@ mainloop:
 		}
 
 		// Handle flow control based on batch processing result
+		if result != batchThrottled {
+			consecutiveThrottles = 0
+		}
+
 		switch result {
+		case batchThrottled:
+			// Overrides the nextThrottle reset above for the next iteration. The
+			// select at the top of the loop still preempts it on stop or commit.
+			consecutiveThrottles++
+			nextThrottle = time.After(throttleBackoff(k.config.throttleDelay, consecutiveThrottles))
+			continue mainloop
 		case batchBreak:
 			break mainloop
 		case batchContinue:

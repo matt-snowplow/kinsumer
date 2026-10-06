@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	smithy "github.com/aws/smithy-go"
 	"github.com/twitchscience/kinsumer/kinsumeriface"
 )
 
@@ -41,6 +43,7 @@ type MockKinesis struct {
 	errorTriggerShard             string
 	useGenericError               bool
 	shouldErrorOnGetShardIterator bool
+	throttlesRemaining            map[string]int
 
 	// Mock data
 	shards       map[string]*mockShard
@@ -109,6 +112,18 @@ func (mk *MockKinesis) SetGenericError(shardID string) {
 	mk.errorTriggerShard = shardID
 	mk.shouldError = true
 	mk.useGenericError = true
+}
+
+// SetThrottleError configures GetRecords to return ProvisionedThroughputExceededException
+// for the next n calls on a shard, after which calls behave normally. The error is wrapped
+// the way the SDK surfaces it once its retryer gives up, so callers must unwrap it
+func (mk *MockKinesis) SetThrottleError(shardID string, n int) {
+	mk.mu.Lock()
+	defer mk.mu.Unlock()
+	if mk.throttlesRemaining == nil {
+		mk.throttlesRemaining = make(map[string]int)
+	}
+	mk.throttlesRemaining[shardID] = n
 }
 
 // SetEmptyRecords configures GetRecords to return empty records for a specific shard
@@ -257,6 +272,20 @@ func (mk *MockKinesis) GetRecords(ctx context.Context, input *kinesis.GetRecords
 
 	mk.mu.Lock()
 	defer mk.mu.Unlock()
+
+	if mk.throttlesRemaining[shardID] > 0 {
+		mk.throttlesRemaining[shardID]--
+		err := &smithy.OperationError{
+			ServiceID:     "Kinesis",
+			OperationName: "GetRecords",
+			Err: &retry.MaxAttemptsError{
+				Attempt: 3,
+				Err:     &types.ProvisionedThroughputExceededException{Message: aws.String("Rate exceeded for Shard")},
+			},
+		}
+		mk.recordCall("GetRecords", shardID, err)
+		return nil, err
+	}
 
 	mk.recordCall("GetRecords", shardID, nil)
 

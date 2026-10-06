@@ -1288,6 +1288,19 @@ func TestProcessRecordsBatchSemaphoreAllPaths(t *testing.T) {
 			runStopGoroutine:   false,
 		},
 		{
+			name: "getRecords_throttled",
+			setupMock: func(mk *mocks.MockKinesis) {
+				mk.SetThrottleError("test-shard", 1) // Return ProvisionedThroughputExceededException once
+			},
+			expectError:        false, // batchThrottled, not error
+			description:        "ProvisionedThroughputExceededException should release semaphore and back off",
+			stopChan:           nil,                             // No stop channel needed
+			recordsChan:        make(chan *consumedRecord, 100), // Buffered - won't block
+			tickerInterval:     100 * time.Millisecond,
+			checkpointerConfig: checkpointerConfig{tableName: "test-table", finished: false, finalSequenceNumber: ""},
+			runStopGoroutine:   false,
+		},
+		{
 			name: "expired_iterator_getShardIterator_fails",
 			setupMock: func(mk *mocks.MockKinesis) {
 				mk.SetBothGetRecordsAndGetShardIteratorErrors("test-shard") // Both GetRecords and GetShardIterator fail
@@ -1397,4 +1410,159 @@ func TestProcessRecordsBatchSemaphoreAllPaths(t *testing.T) {
 			t.Logf("✓ %s: Semaphore properly released (before=%d, after=%d)", tc.description, before, after)
 		})
 	}
+}
+
+func TestThrottleBackoff(t *testing.T) {
+	base := 250 * time.Millisecond
+
+	testCases := []struct {
+		name        string
+		consecutive int
+		want        time.Duration
+	}{
+		{name: "no throttles", consecutive: 0, want: base},
+		{name: "first throttle doubles", consecutive: 1, want: 500 * time.Millisecond},
+		{name: "keeps doubling", consecutive: 3, want: 2 * time.Second},
+		{name: "capped", consecutive: 6, want: maxThrottleBackoff},
+		{name: "large n does not overflow", consecutive: 64, want: maxThrottleBackoff},
+		{name: "negative treated as none", consecutive: -1, want: base},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, throttleBackoff(base, tc.consecutive))
+		})
+	}
+}
+
+// TestProcessRecordsBatchThrottled checks that a throttled GetRecords keeps the
+// iterator and asks consume to back off, instead of ending the shard consumer.
+func TestProcessRecordsBatchThrottled(t *testing.T) {
+	semaphore := make(chan struct{}, 1)
+	mk := mocks.NewMockKinesis([]string{"test-shard"})
+	mk.SetThrottleError("test-shard", 1)
+
+	k := &Kinsumer{
+		kinesis:        mk,
+		shardSemaphore: semaphore,
+		records:        make(chan *consumedRecord, 100),
+		config:         NewConfig(),
+		metricsManager: newMetricsManager(&DefaultLogger{}),
+	}
+
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	lastSeq, lastSeqNum := "", ""
+	iterator := "iter-test-shard-0"
+
+	next, result, err := k.processRecordsBatch(iterator, "test-shard", &checkpointer{}, &lastSeq, &lastSeqNum, ticker)
+
+	require.NoError(t, err)
+	assert.Equal(t, batchThrottled, result)
+	assert.Equal(t, iterator, next, "a throttle must not lose the iterator")
+	assert.Equal(t, 0, len(semaphore), "semaphore must be released on the throttled path")
+}
+
+// newMockConsumer builds a Kinsumer wired to in-memory Kinesis and DynamoDB
+// mocks, sufficient to run consume for a single shard. After a stop, consume
+// keeps committing until delivered records are checkpointed or half of
+// maxAgeForClientRecord passes; these tests never checkpoint, so both are kept
+// short to let consume exit promptly.
+func newMockConsumer(mk *mocks.MockKinesis, throttleDelay time.Duration) *Kinsumer {
+	return &Kinsumer{
+		kinesis:               mk,
+		dynamodb:              mocks.NewMockDynamo([]string{"checkpoints"}),
+		streamName:            "stream",
+		stop:                  make(chan struct{}),
+		records:               make(chan *consumedRecord, 100),
+		shardErrors:           make(chan shardConsumerError, 10),
+		checkpointTableName:   "checkpoints",
+		clientID:              "client-id",
+		clientName:            "client",
+		maxAgeForClientRecord: 40 * time.Millisecond,
+		config:                NewConfig().WithThrottleDelay(throttleDelay).WithCommitFrequency(10 * time.Millisecond),
+		metricsManager:        newMetricsManager(&DefaultLogger{}),
+	}
+}
+
+// runConsume starts consume for test-shard and returns a func that stops it and
+// reports whether it exited within the timeout.
+func runConsume(k *Kinsumer) func(timeout time.Duration) bool {
+	k.waitGroup.Add(1)
+	go k.consume("test-shard")
+
+	return func(timeout time.Duration) bool {
+		close(k.stop)
+
+		done := make(chan struct{})
+		go func() {
+			k.waitGroup.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			return true
+		case <-time.After(timeout):
+			return false
+		}
+	}
+}
+
+func TestConsumeRecoversFromThrottling(t *testing.T) {
+	mk := mocks.NewMockKinesis([]string{"test-shard"})
+	mk.SetThrottleError("test-shard", 3)
+
+	k := newMockConsumer(mk, time.Millisecond)
+	stop := runConsume(k)
+
+	select {
+	case rec := <-k.records:
+		assert.Equal(t, "record-test-shard-0", string(rec.record.Data))
+	case err := <-k.shardErrors:
+		t.Fatalf("throttling ended the shard consumer: %s: %v", err.action, err.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no record delivered after throttling cleared")
+	}
+
+	assert.True(t, stop(5*time.Second), "consume did not stop")
+	assert.Empty(t, k.shardErrors, "throttling must not report a shard error")
+	assert.GreaterOrEqual(t, mk.GetTotalCalls(), 4, "3 throttled calls plus at least one served")
+}
+
+func TestConsumeGenericErrorStillFatal(t *testing.T) {
+	mk := mocks.NewMockKinesis([]string{"test-shard"})
+	mk.SetGenericError("test-shard")
+
+	k := newMockConsumer(mk, time.Millisecond)
+	stop := runConsume(k)
+
+	select {
+	case err := <-k.shardErrors:
+		assert.Equal(t, "processRecordsBatch", err.action)
+		assert.ErrorContains(t, err.err, "simulated kinesis error")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a non-throttle GetRecords error must still end the shard consumer")
+	}
+
+	assert.True(t, stop(5*time.Second), "consume did not exit")
+}
+
+// TestConsumeStopDuringBackoff checks that a long backoff cannot delay Stop.
+func TestConsumeStopDuringBackoff(t *testing.T) {
+	mk := mocks.NewMockKinesis([]string{"test-shard"})
+	mk.SetThrottleError("test-shard", 1000)
+
+	// 2s base: the first backoff is already 4s, well past the stop deadline.
+	k := newMockConsumer(mk, 2*time.Second)
+	stop := runConsume(k)
+
+	require.Eventually(t, func() bool { return mk.GetTotalCalls() >= 1 }, 5*time.Second, time.Millisecond,
+		"consumer never issued GetRecords")
+
+	start := time.Now()
+	assert.True(t, stop(time.Second), "Stop blocked behind the throttle backoff")
+	assert.Less(t, time.Since(start), time.Second)
+	assert.Equal(t, 1, mk.GetTotalCalls(), "no retry should fire before the backoff elapses")
 }
